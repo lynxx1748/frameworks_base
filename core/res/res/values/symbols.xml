@@ -2755,4 +2755,7 @@
   <java-symbol type="drawable" name="lockscreen_notselected" />
   <java-symbol type="drawable" name="lockscreen_selected" />
 
+  <!-- Add Samsung STK Support -->
+  <java-symbol type="bool" name="config_samsung_stk" />
+
 </resources>
