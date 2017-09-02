@@ -551,6 +551,11 @@ interface ITelephony {
      * Sets minimum time in milli-seconds between onCellInfoChanged
      */
     void setCellInfoListRate(int rateInMillis);
+ 
+     /**
+      * Return if the current radio is LTE on GSM
+      */
+     int getLteOnGsmMode();
 
     /**
      * get default sim
