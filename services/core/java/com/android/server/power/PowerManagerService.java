@@ -19,7 +19,6 @@ package com.android.server.power;
 import android.Manifest;
 import android.annotation.IntDef;
 import android.app.ActivityManager;
-import android.app.AppOpsManager;
 import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
 import android.content.Context;
@@ -73,6 +72,7 @@ import com.android.internal.app.IBatteryStats;
 import com.android.internal.os.BackgroundThread;
 import com.android.internal.util.ArrayUtils;
 import com.android.server.EventLogTags;
+import com.android.server.LocalServices;
 import com.android.server.ServiceThread;
 import com.android.server.SystemService;
 import com.android.server.Watchdog;
@@ -114,7 +114,7 @@ public final class PowerManagerService extends SystemService
     private static final int MSG_SCREEN_BRIGHTNESS_BOOST_TIMEOUT = 3;
     // Message: Polling to look for long held wake locks.
     private static final int MSG_CHECK_FOR_LONG_WAKELOCKS = 4;
-    // Message: Sent when the screen on is requested.
+
     private static final int MSG_WAKE_UP = 5;
 
     // Dirty bit: mWakeLocks changed
@@ -141,8 +141,6 @@ public final class PowerManagerService extends SystemService
     private static final int DIRTY_DOCK_STATE = 1 << 10;
     // Dirty bit: brightness boost changed
     private static final int DIRTY_SCREEN_BRIGHTNESS_BOOST = 1 << 11;
-    // Dirty bit: VR Mode enabled changed
-    private static final int DIRTY_VR_MODE_CHANGED = 1 << 12;
 
     // Summarizes the state of all active wakelocks.
     private static final int WAKE_LOCK_CPU = 1 << 0;
@@ -179,6 +177,8 @@ public final class PowerManagerService extends SystemService
     // Power features defined in hardware/libhardware/include/hardware/power.h.
     private static final int POWER_FEATURE_DOUBLE_TAP_TO_WAKE = 1;
 
+    private static final int DEFAULT_BUTTON_ON_DURATION = 5 * 1000;
+
     // Default setting for double tap to wake.
     private static final int DEFAULT_DOUBLE_TAP_TO_WAKE = 0;
 
@@ -190,7 +190,8 @@ public final class PowerManagerService extends SystemService
     private static final int HALT_MODE_REBOOT = 1;
     private static final int HALT_MODE_REBOOT_SAFE_MODE = 2;
 
-    // Threshold for proximity check on wakeup
+    private static final int BUTTON_ON_DURATION = 5 * 1000;
+
     private static final float PROXIMITY_NEAR_THRESHOLD = 5.0f;
 
     private final Context mContext;
@@ -208,6 +209,16 @@ public final class PowerManagerService extends SystemService
     private SettingsObserver mSettingsObserver;
     private DreamManagerInternal mDreamManager;
     private Light mAttentionLight;
+    private Light mButtonsLight;
+    private Light mKeyboardLight;
+    private Light mCapsLight;
+    private Light mFnLight;
+
+    private int mButtonTimeout;
+    private int mButtonBrightness;
+    private int mButtonBrightnessSettingDefault;
+    private int mKeyboardBrightness;
+    private int mKeyboardBrightnessSettingDefault;
 
     private final Object mLock = new Object();
 
@@ -424,14 +435,10 @@ public final class PowerManagerService extends SystemService
     private int mScreenBrightnessSettingMinimum;
     private int mScreenBrightnessSettingMaximum;
     private int mScreenBrightnessSettingDefault;
-    private int mScreenBrightnessForVrSettingDefault;
 
     // The screen brightness setting, from 0 to 255.
     // Use -1 if no value has been set.
     private int mScreenBrightnessSetting;
-
-    // The screen brightness setting, from 0 to 255, to be used while in VR Mode.
-    private int mScreenBrightnessForVrSetting;
 
     // The screen auto-brightness adjustment setting, from -1 to 1.
     // Use 0 if there is no adjustment.
@@ -453,6 +460,11 @@ public final class PowerManagerService extends SystemService
     // The next possible user activity timeout after being explicitly told the user is inactive.
     // Set to -1 when not told the user is inactive since the last period spent dozing or asleep.
     private long mOverriddenTimeout = -1;
+
+    // The button brightness setting override from the window manager
+    // to allow the current foreground activity to override the button brightness.
+    // Use -1 to disable.
+    private int mButtonBrightnessOverrideFromWindowManager = -1;
 
     // The user activity timeout override from the window manager
     // to allow the current foreground activity to override the user activity timeout.
@@ -506,7 +518,7 @@ public final class PowerManagerService extends SystemService
     // Set of app ids that are temporarily allowed to acquire wakelocks due to high-pri message
     int[] mDeviceIdleTempWhitelist = new int[0];
 
-    private QCNsrmPowerExtension qcNsrmPowExt = new QCNsrmPowerExtension(this);
+    private QCNsrmPowerExtension qcNsrmPowExt;
 
     private final SparseIntArray mUidState = new SparseIntArray();
 
@@ -519,8 +531,6 @@ public final class PowerManagerService extends SystemService
     private final ArrayList<PowerManagerInternal.LowPowerModeListener> mLowPowerModeListeners
             = new ArrayList<PowerManagerInternal.LowPowerModeListener>();
 
-    // True if we are currently in VR Mode.
-    private boolean mIsVrModeEnabled;
 
     private native void nativeInit();
 
@@ -530,14 +540,23 @@ public final class PowerManagerService extends SystemService
     private static native void nativeSetAutoSuspend(boolean enable);
     private static native void nativeSendPowerHint(int hintId, int data);
     private static native void nativeSetFeature(int featureId, int data);
+    private static native int nativeGetFeature(int featureId);
 
-    private SensorManager mSensorManager;
-    private Sensor mProximitySensor;
+    private boolean mForceNavbar;
+
+
+    private boolean mKeyboardVisible = false;
+
+    // Whether proximity check on wake is enabled by default
+    private boolean mProximityWakeEnabledByDefaultConfig;
+
+    private boolean mProximityWakeSupported;
     private boolean mProximityWakeEnabled;
     private int mProximityTimeOut;
-    private boolean mProximityWakeSupported;
-    android.os.PowerManager.WakeLock mProximityWakeLock;
-    SensorEventListener mProximityListener;
+    private SensorManager mSensorManager;
+    private Sensor mProximitySensor;
+    private SensorEventListener mProximityListener;
+    private android.os.PowerManager.WakeLock mProximityWakeLock;
 
     public PowerManagerService(Context context) {
         super(context);
@@ -546,7 +565,7 @@ public final class PowerManagerService extends SystemService
                 Process.THREAD_PRIORITY_DISPLAY, false /*allowIo*/);
         mHandlerThread.start();
         mHandler = new PowerManagerHandler(mHandlerThread.getLooper());
-
+        qcNsrmPowExt = new QCNsrmPowerExtension(this);
         synchronized (mLock) {
             mWakeLockSuspendBlocker = createSuspendBlockerLocked("PowerManagerService.WakeLocks");
             mDisplaySuspendBlocker = createSuspendBlockerLocked("PowerManagerService.Display");
@@ -598,6 +617,7 @@ public final class PowerManagerService extends SystemService
         }
     }
 
+
     public void systemReady(IAppOpsService appOps) {
         synchronized (mLock) {
             mSystemReady = true;
@@ -611,7 +631,8 @@ public final class PowerManagerService extends SystemService
             mScreenBrightnessSettingMinimum = pm.getMinimumScreenBrightnessSetting();
             mScreenBrightnessSettingMaximum = pm.getMaximumScreenBrightnessSetting();
             mScreenBrightnessSettingDefault = pm.getDefaultScreenBrightnessSetting();
-            mScreenBrightnessForVrSettingDefault = pm.getDefaultScreenBrightnessForVrSetting();
+            mButtonBrightnessSettingDefault = pm.getDefaultButtonBrightness();
+            mKeyboardBrightnessSettingDefault = pm.getDefaultKeyboardBrightness();
 
             SensorManager sensorManager = new SystemSensorManager(mContext, mHandler.getLooper());
 
@@ -629,6 +650,8 @@ public final class PowerManagerService extends SystemService
 
             mLightsManager = getLocalService(LightsManager.class);
             mAttentionLight = mLightsManager.getLight(LightsManager.LIGHT_ID_ATTENTION);
+            mButtonsLight = mLightsManager.getLight(LightsManager.LIGHT_ID_BUTTONS);
+            mKeyboardLight = mLightsManager.getLight(LightsManager.LIGHT_ID_KEYBOARD);
 
             // Initialize display power management.
             mDisplayManagerInternal.initPowerManagement(
@@ -681,9 +704,6 @@ public final class PowerManagerService extends SystemService
                     Settings.System.SCREEN_BRIGHTNESS),
                     false, mSettingsObserver, UserHandle.USER_ALL);
             resolver.registerContentObserver(Settings.System.getUriFor(
-                    Settings.System.SCREEN_BRIGHTNESS_FOR_VR),
-                    false, mSettingsObserver, UserHandle.USER_ALL);
-            resolver.registerContentObserver(Settings.System.getUriFor(
                     Settings.System.SCREEN_BRIGHTNESS_MODE),
                     false, mSettingsObserver, UserHandle.USER_ALL);
             resolver.registerContentObserver(Settings.System.getUriFor(
@@ -701,27 +721,30 @@ public final class PowerManagerService extends SystemService
             resolver.registerContentObserver(Settings.Secure.getUriFor(
                     Settings.Secure.DOUBLE_TAP_TO_WAKE),
                     false, mSettingsObserver, UserHandle.USER_ALL);
+            IVrManager vrManager =
+                    (IVrManager) getBinderService(VrManagerService.VR_MANAGER_BINDER_SERVICE);
+            try {
+                vrManager.registerListener(mVrStateCallbacks);
+            } catch (RemoteException e) {
+                Slog.e(TAG, "Failed to register VR mode state listener: " + e);
+            }
+
+            resolver.registerContentObserver(Settings.Global.getUriFor(
+                    Settings.System.BUTTON_BRIGHTNESS),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.Global.getUriFor(
+                    Settings.System.KEYBOARD_BRIGHTNESS),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.Global.getUriFor(
+                    Settings.System.BUTTON_BACKLIGHT_TIMEOUT),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
             resolver.registerContentObserver(Settings.Global.getUriFor(
                     Settings.Global.WAKE_WHEN_PLUGGED_OR_UNPLUGGED),
                     false, mSettingsObserver, UserHandle.USER_ALL);
             resolver.registerContentObserver(Settings.System.getUriFor(
-                    Settings.System.AMBIENT_DOZE_CUSTOM_BRIGHTNESS),
-                    false, mSettingsObserver, UserHandle.USER_ALL);
-            resolver.registerContentObserver(Settings.System.getUriFor(
-                    Settings.System.AMBIENT_DOZE_AUTO_BRIGHTNESS),
-                    false, mSettingsObserver, UserHandle.USER_ALL);
-            resolver.registerContentObserver(Settings.System.getUriFor(
                     Settings.System.PROXIMITY_ON_WAKE),
                     false, mSettingsObserver, UserHandle.USER_ALL);
-            IVrManager vrManager =
-                    (IVrManager) getBinderService(VrManagerService.VR_MANAGER_BINDER_SERVICE);
-            if (vrManager != null) {
-                try {
-                    vrManager.registerListener(mVrStateCallbacks);
-                } catch (RemoteException e) {
-                    Slog.e(TAG, "Failed to register VR mode state listener: " + e);
-                }
-            }
+
             // Go.
             readConfigurationLocked();
             updateSettingsLocked();
@@ -769,14 +792,13 @@ public final class PowerManagerService extends SystemService
                 com.android.internal.R.fraction.config_maximumScreenDimRatio, 1, 1);
         mSupportsDoubleTapWakeConfig = resources.getBoolean(
                 com.android.internal.R.bool.config_supportDoubleTapWake);
-        mProximityTimeOut = resources.getInteger(
-                com.android.internal.R.integer.config_proximityCheckTimeout);
         mProximityWakeSupported = resources.getBoolean(
                 com.android.internal.R.bool.config_proximityCheckOnWake);
+        mProximityTimeOut = resources.getInteger(
+                com.android.internal.R.integer.config_proximityCheckTimeout);
         if (mProximityWakeSupported) {
-            PowerManager powerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
-            mProximityWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
-                    "ProximityWakeLock");
+            mProximityWakeLock = ((PowerManager) mContext.getSystemService(Context.POWER_SERVICE))
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ProximityWakeLock");
         }
     }
 
@@ -808,8 +830,6 @@ public final class PowerManagerService extends SystemService
         mWakeUpWhenPluggedOrUnpluggedSetting = Settings.Global.getInt(resolver,
                 Settings.Global.WAKE_WHEN_PLUGGED_OR_UNPLUGGED,
                 (mWakeUpWhenPluggedOrUnpluggedConfig ? 1 : 0));
-        mProximityWakeEnabled = Settings.System.getInt(resolver,
-                Settings.System.PROXIMITY_ON_WAKE, 0) == 1;
 
         if (mSupportsDoubleTapWakeConfig) {
             boolean doubleTapWakeEnabled = Settings.Secure.getIntForUser(resolver,
@@ -821,17 +841,11 @@ public final class PowerManagerService extends SystemService
             }
         }
 
-        final int oldScreenBrightnessSetting = getCurrentBrightnessSettingLocked();
-
-        mScreenBrightnessForVrSetting = Settings.System.getIntForUser(resolver,
-                Settings.System.SCREEN_BRIGHTNESS_FOR_VR, mScreenBrightnessForVrSettingDefault,
-                UserHandle.USER_CURRENT);
-
+        final int oldScreenBrightnessSetting = mScreenBrightnessSetting;
         mScreenBrightnessSetting = Settings.System.getIntForUser(resolver,
                 Settings.System.SCREEN_BRIGHTNESS, mScreenBrightnessSettingDefault,
                 UserHandle.USER_CURRENT);
-
-        if (oldScreenBrightnessSetting != getCurrentBrightnessSettingLocked()) {
+        if (oldScreenBrightnessSetting != mScreenBrightnessSetting) {
             mTemporaryScreenBrightnessSettingOverride = -1;
         }
 
@@ -859,26 +873,21 @@ public final class PowerManagerService extends SystemService
             updateLowPowerModeLocked();
         }
 
-        mDirty |= DIRTY_SETTINGS;
+        mButtonTimeout = Settings.System.getIntForUser(resolver,
+                Settings.System.BUTTON_BACKLIGHT_TIMEOUT,
+                DEFAULT_BUTTON_ON_DURATION, UserHandle.USER_CURRENT);
 
-        final Resources resources = mContext.getResources();
-        final int defaultDozeBrightness = resources.getInteger(
-                com.android.internal.R.integer.config_screenBrightnessDoze);
-        int customDozeBrightness = Settings.System.getIntForUser(resolver,
-                Settings.System.AMBIENT_DOZE_CUSTOM_BRIGHTNESS, defaultDozeBrightness,
+        mButtonBrightness = Settings.System.getIntForUser(resolver,
+                Settings.System.BUTTON_BRIGHTNESS, mButtonBrightnessSettingDefault,
                 UserHandle.USER_CURRENT);
-        mDisplayManagerInternal.updateCustomBrightnessDozeValue(customDozeBrightness);
+        mKeyboardBrightness = Settings.System.getIntForUser(resolver,
+                Settings.System.KEYBOARD_BRIGHTNESS, mKeyboardBrightnessSettingDefault,
+                UserHandle.USER_CURRENT);
+        mProximityWakeEnabled = Settings.System.getInt(resolver,
+                Settings.System.PROXIMITY_ON_WAKE,
+                mProximityWakeEnabledByDefaultConfig ? 1 : 0) == 1;
 
-        final boolean defaultIsAutoDozeBrightness = resources.getBoolean(
-                com.android.internal.R.bool.config_allowAutoBrightnessWhileDozing);
-        boolean isAutoDozeBrightness = Settings.System.getIntForUser(resolver,
-                Settings.System.AMBIENT_DOZE_AUTO_BRIGHTNESS, defaultIsAutoDozeBrightness ? 1 : 0,
-                UserHandle.USER_CURRENT) == 1;
-        mDisplayManagerInternal.enableAutoDozeBrightness(isAutoDozeBrightness);
-    }
-
-    private int getCurrentBrightnessSettingLocked() {
-        return mIsVrModeEnabled ? mScreenBrightnessForVrSetting : mScreenBrightnessSetting;
+        mDirty |= DIRTY_SETTINGS;
     }
 
     private void postAfterBootCompleted(Runnable r) {
@@ -900,6 +909,7 @@ public final class PowerManagerService extends SystemService
             // Turn setting off if powered
             Settings.Global.putInt(mContext.getContentResolver(),
                     Settings.Global.LOW_POWER_MODE, 0);
+            // update performance profile
             mLowPowerModeSetting = false;
         }
         final boolean autoLowPowerModeEnabled = !mIsPowered && mAutoLowPowerModeConfigured
@@ -1802,10 +1812,42 @@ public final class PowerManagerService extends SystemService
                             + screenOffTimeout - screenDimDuration;
                     if (now < nextTimeout) {
                         mUserActivitySummary = USER_ACTIVITY_SCREEN_BRIGHT;
+                        if (mWakefulness == WAKEFULNESS_AWAKE) {
+                            int buttonBrightness, keyboardBrightness;
+                            if (mButtonBrightnessOverrideFromWindowManager >= 0) {
+                                buttonBrightness = mButtonBrightnessOverrideFromWindowManager;
+                                keyboardBrightness = mButtonBrightnessOverrideFromWindowManager;
+                            } else {
+                                if (!mForceNavbar) {
+                                    buttonBrightness = mButtonBrightness;
+                                } else {
+                                    buttonBrightness = 0;
+                                }
+                                keyboardBrightness = mKeyboardBrightness;
+                            }
+
+                            mKeyboardLight.setBrightness(mKeyboardVisible ?
+                                    keyboardBrightness : 0);
+                            if (mButtonTimeout != 0
+                                    && now > mLastUserActivityTime + mButtonTimeout) {
+                                mButtonsLight.setBrightness(0);
+                            } else {
+                                if (!mProximityPositive) {
+                                    mButtonsLight.setBrightness(buttonBrightness);
+                                    if (buttonBrightness != 0 && mButtonTimeout != 0) {
+                                        nextTimeout = now + mButtonTimeout;
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         nextTimeout = mLastUserActivityTime + screenOffTimeout;
                         if (now < nextTimeout) {
                             mUserActivitySummary = USER_ACTIVITY_SCREEN_DIM;
+                            if (mWakefulness == WAKEFULNESS_AWAKE) {
+                                mButtonsLight.setBrightness(0);
+                                mKeyboardLight.setBrightness(0);
+                            }
                         }
                     }
                 }
@@ -2118,7 +2160,6 @@ public final class PowerManagerService extends SystemService
                 || !mDreamsSupportedConfig
                 || !mDreamsEnabledSetting
                 || !mDisplayPowerRequest.isBrightOrDim()
-                || mDisplayPowerRequest.isVr()
                 || (mUserActivitySummary & (USER_ACTIVITY_SCREEN_BRIGHT
                         | USER_ACTIVITY_SCREEN_DIM | USER_ACTIVITY_SCREEN_DREAM)) == 0
                 || !mBootCompleted) {
@@ -2163,7 +2204,7 @@ public final class PowerManagerService extends SystemService
         final boolean oldDisplayReady = mDisplayReady;
         if ((dirty & (DIRTY_WAKE_LOCKS | DIRTY_USER_ACTIVITY | DIRTY_WAKEFULNESS
                 | DIRTY_ACTUAL_DISPLAY_POWER_STATE_UPDATED | DIRTY_BOOT_COMPLETED
-                | DIRTY_SETTINGS | DIRTY_SCREEN_BRIGHTNESS_BOOST | DIRTY_VR_MODE_CHANGED)) != 0) {
+                | DIRTY_SETTINGS | DIRTY_SCREEN_BRIGHTNESS_BOOST)) != 0) {
             mDisplayPowerRequest.policy = getDesiredScreenPolicyLocked();
 
             // Determine appropriate screen brightness and auto-brightness adjustments.
@@ -2177,9 +2218,6 @@ public final class PowerManagerService extends SystemService
                 // bootloader brightness and the default brightness to be identical.
                 autoBrightness = false;
                 brightnessSetByUser = false;
-            } else if (mIsVrModeEnabled) {
-                screenBrightness = mScreenBrightnessForVrSetting;
-                autoBrightness = false;
             } else if (isValidBrightness(mScreenBrightnessOverrideFromWindowManager)) {
                 screenBrightness = mScreenBrightnessOverrideFromWindowManager;
                 autoBrightness = false;
@@ -2213,7 +2251,7 @@ public final class PowerManagerService extends SystemService
             mDisplayPowerRequest.useAutoBrightness = autoBrightness;
             mDisplayPowerRequest.useProximitySensor = shouldUseProximitySensorLocked();
             mDisplayPowerRequest.lowPowerMode = mLowPowerModeEnabled;
-            mDisplayPowerRequest.boostScreenBrightness = shouldBoostScreenBrightness();
+            mDisplayPowerRequest.boostScreenBrightness = mScreenBrightnessBoostInProgress;
 
             if (mDisplayPowerRequest.policy == DisplayPowerRequest.POLICY_DOZE) {
                 mDisplayPowerRequest.dozeScreenState = mDozeScreenStateOverrideFromDreamManager;
@@ -2239,7 +2277,6 @@ public final class PowerManagerService extends SystemService
                         + ", mWakeLockSummary=0x" + Integer.toHexString(mWakeLockSummary)
                         + ", mUserActivitySummary=0x" + Integer.toHexString(mUserActivitySummary)
                         + ", mBootCompleted=" + mBootCompleted
-                        + ", mIsVrModeEnabled= " + mIsVrModeEnabled
                         + ", mScreenBrightnessBoostInProgress="
                                 + mScreenBrightnessBoostInProgress);
             }
@@ -2270,10 +2307,6 @@ public final class PowerManagerService extends SystemService
         }
     }
 
-    private boolean shouldBoostScreenBrightness() {
-        return !mIsVrModeEnabled && mScreenBrightnessBoostInProgress;
-    }
-
     private static boolean isValidBrightness(int value) {
         return value >= 0 && value <= 255;
     }
@@ -2284,10 +2317,6 @@ public final class PowerManagerService extends SystemService
     }
 
     private int getDesiredScreenPolicyLocked() {
-        if (mIsVrModeEnabled) {
-            return DisplayPowerRequest.POLICY_VR;
-        }
-
         if (mWakefulness == WAKEFULNESS_ASLEEP) {
             return DisplayPowerRequest.POLICY_OFF;
         }
@@ -2391,7 +2420,7 @@ public final class PowerManagerService extends SystemService
     };
 
     private boolean shouldUseProximitySensorLocked() {
-        return !mIsVrModeEnabled && (mWakeLockSummary & WAKE_LOCK_PROXIMITY_SCREEN_OFF) != 0;
+        return (mWakeLockSummary & WAKE_LOCK_PROXIMITY_SCREEN_OFF) != 0;
     }
 
     /**
@@ -3051,11 +3080,7 @@ public final class PowerManagerService extends SystemService
             pw.println("  mScreenBrightnessSettingMinimum=" + mScreenBrightnessSettingMinimum);
             pw.println("  mScreenBrightnessSettingMaximum=" + mScreenBrightnessSettingMaximum);
             pw.println("  mScreenBrightnessSettingDefault=" + mScreenBrightnessSettingDefault);
-            pw.println("  mScreenBrightnessForVrSettingDefault="
-                    + mScreenBrightnessForVrSettingDefault);
-            pw.println("  mScreenBrightnessForVrSetting=" + mScreenBrightnessForVrSetting);
             pw.println("  mDoubleTapWakeEnabled=" + mDoubleTapWakeEnabled);
-            pw.println("  mIsVrModeEnabled=" + mIsVrModeEnabled);
 
             final int sleepTimeout = getSleepTimeoutLocked();
             final int screenOffTimeout = getScreenOffTimeoutLocked(sleepTimeout);
@@ -3182,14 +3207,6 @@ public final class PowerManagerService extends SystemService
         @Override
         public void onVrStateChanged(boolean enabled) {
             powerHintInternal(POWER_HINT_VR_MODE, enabled ? 1 : 0);
-
-            synchronized (mLock) {
-                if (mIsVrModeEnabled != enabled) {
-                    mIsVrModeEnabled = enabled;
-                    mDirty |= DIRTY_VR_MODE_CHANGED;
-                    updatePowerStateLocked();
-                }
-            }
         }
     };
 
@@ -3426,22 +3443,6 @@ public final class PowerManagerService extends SystemService
         }
     }
 
-    private void cleanupProximity() {
-        synchronized (mProximityWakeLock) {
-            cleanupProximityLocked();
-        }
-    }
-
-    private void cleanupProximityLocked() {
-        if (mProximityWakeLock.isHeld()) {
-            mProximityWakeLock.release();
-        }
-        if (mProximityListener != null) {
-            mSensorManager.unregisterListener(mProximityListener);
-            mProximityListener = null;
-        }
-    }
-
     private final class BinderService extends IPowerManager.Stub {
         @Override // Binder call
         public void acquireWakeLockWithUid(IBinder lock, int flags, String tag,
@@ -3487,20 +3488,6 @@ public final class PowerManagerService extends SystemService
 
             final int uid = Binder.getCallingUid();
             final int pid = Binder.getCallingPid();
-
-            try {
-                if (mAppOps != null &&
-                        mAppOps.checkOperation(AppOpsManager.OP_WAKE_LOCK, uid, packageName)
-                        != AppOpsManager.MODE_ALLOWED) {
-                    Slog.d(TAG, "acquireWakeLock: ignoring request from " + packageName);
-                    // For (ignore) accounting purposes
-                    mAppOps.noteOperation(AppOpsManager.OP_WAKE_LOCK, uid, packageName);
-                    // silent return
-                    return;
-                }
-            } catch (RemoteException e) {
-            }
-
             final long ident = Binder.clearCallingIdentity();
             try {
                 acquireWakeLockInternal(lock, flags, tag, packageName, ws, historyTag, uid, pid);
@@ -3610,11 +3597,23 @@ public final class PowerManagerService extends SystemService
             }
         }
 
+        
+
+        @Override // Binder call
+        public void wakeUp(long eventTime, String reason, String opPackageName) {
+            wakeUp(eventTime, reason, opPackageName, false);
+        }
+
+        @Override // Binder call
+        public void wakeUpWithProximityCheck(long eventTime, String reason, String opPackageName) {
+            wakeUp(eventTime, reason, opPackageName, true);
+        }
+
         /**
          * @hide
          */
-        private void wakeUp(final long eventTime, final String reason, final String opPackageName,
-                boolean checkProximity) {
+        private void wakeUp(long eventTime, String reason, String opPackageName,
+                final boolean checkProximity) {
             if (eventTime > SystemClock.uptimeMillis()) {
                 throw new IllegalArgumentException("event time must not be in the future");
             }
@@ -3623,7 +3622,7 @@ public final class PowerManagerService extends SystemService
                     android.Manifest.permission.DEVICE_POWER, null);
 
             final int uid = Binder.getCallingUid();
-            Runnable r = new Runnable() {
+            final Runnable r = new Runnable() {
                 @Override
                 public void run() {
                     final long ident = Binder.clearCallingIdentity();
@@ -3639,70 +3638,6 @@ public final class PowerManagerService extends SystemService
             } else {
                 r.run();
             }
-        }
-
-        private void runWithProximityCheck(Runnable r) {
-            if (mHandler.hasMessages(MSG_WAKE_UP)) {
-                // There is already a message queued;
-                return;
-            }
-
-            TelephonyManager tm = (TelephonyManager)mContext.getSystemService(
-                    Context.TELEPHONY_SERVICE);
-            boolean hasIncomingCall = tm.getCallState() == TelephonyManager.CALL_STATE_RINGING;
-
-            if (mProximityWakeSupported && mProximityWakeEnabled && mProximitySensor != null
-                    && !hasIncomingCall) {
-                Message msg = mHandler.obtainMessage(MSG_WAKE_UP);
-                msg.obj = r;
-                mHandler.sendMessageDelayed(msg, mProximityTimeOut);
-                runPostProximityCheck(r);
-            } else {
-                r.run();
-            }
-        }
-
-        private void runPostProximityCheck(final Runnable r) {
-            if (mSensorManager == null) {
-                r.run();
-                return;
-            }
-            synchronized (mProximityWakeLock) {
-                mProximityWakeLock.acquire();
-                mProximityListener = new SensorEventListener() {
-                    @Override
-                    public void onSensorChanged(SensorEvent event) {
-                        cleanupProximityLocked();
-                        if (!mHandler.hasMessages(MSG_WAKE_UP)) {
-                            Slog.w(TAG, "The proximity sensor took too long, wake event already triggered!");
-                            return;
-                        }
-                        mHandler.removeMessages(MSG_WAKE_UP);
-                        float distance = event.values[0];
-                        if (distance >= PROXIMITY_NEAR_THRESHOLD ||
-                                distance >= mProximitySensor.getMaximumRange()) {
-                            r.run();
-                        } else {
-                            Slog.w(TAG, "Not waking up.  Proximity sensor blocked.");
-                        }
-                    }
-
-                    @Override
-                    public void onAccuracyChanged(Sensor sensor, int accuracy) {}
-                };
-                mSensorManager.registerListener(mProximityListener,
-                       mProximitySensor, SensorManager.SENSOR_DELAY_FASTEST);
-            }
-        }
-
-        @Override // Binder call
-        public void wakeUpWithProximityCheck(long eventTime, String reason, String opPackageName) {
-            wakeUp(eventTime, reason, opPackageName, true);
-        }
-
-        @Override // Binder call
-        public void wakeUp(long eventTime, String reason, String opPackageName) {
-            wakeUp(eventTime, reason, opPackageName, false);
         }
 
         @Override // Binder call
@@ -3996,6 +3931,7 @@ public final class PowerManagerService extends SystemService
             }
         }
 
+
         @Override // Binder call
         protected void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
             if (mContext.checkCallingOrSelfPermission(Manifest.permission.DUMP)
@@ -4026,6 +3962,16 @@ public final class PowerManagerService extends SystemService
         }
     }
 
+    private void setButtonBrightnessOverrideFromWindowManagerInternal(int brightness) {
+        synchronized (mLock) {
+            if (mButtonBrightnessOverrideFromWindowManager != brightness) {
+                mButtonBrightnessOverrideFromWindowManager = brightness;
+                mDirty |= DIRTY_SETTINGS;
+                updatePowerStateLocked();
+            }
+        }
+    }
+
     private final class LocalService extends PowerManagerInternal {
         @Override
         public void setScreenBrightnessOverrideFromWindowManager(int screenBrightness) {
@@ -4038,8 +3984,15 @@ public final class PowerManagerService extends SystemService
 
         @Override
         public void setButtonBrightnessOverrideFromWindowManager(int screenBrightness) {
-            // Do nothing.
-            // Button lights are not currently supported in the new implementation.
+            mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+            final long ident = Binder.clearCallingIdentity();
+            try {
+                setButtonBrightnessOverrideFromWindowManagerInternal(screenBrightness);
+            } finally {
+                Binder.restoreCallingIdentity(ident);
+            }
+
         }
 
         @Override
@@ -4050,7 +4003,6 @@ public final class PowerManagerService extends SystemService
                 case Display.STATE_DOZE:
                 case Display.STATE_DOZE_SUSPEND:
                 case Display.STATE_ON:
-                case Display.STATE_VR:
                     break;
                 default:
                     screenState = Display.STATE_UNKNOWN;
@@ -4125,6 +4077,79 @@ public final class PowerManagerService extends SystemService
         @Override
         public void powerHint(int hintId, int data) {
             powerHintInternal(hintId, data);
+        }
+
+    }
+
+    private void cleanupProximity() {
+        synchronized (mProximityWakeLock) {
+            cleanupProximityLocked();
+        }
+    }
+
+    private void cleanupProximityLocked() {
+        if (mProximityWakeLock.isHeld()) {
+            mProximityWakeLock.release();
+        }
+        if (mProximityListener != null) {
+            mSensorManager.unregisterListener(mProximityListener);
+            mProximityListener = null;
+        }
+    }
+
+    private void runWithProximityCheck(final Runnable r) {
+        if (mHandler.hasMessages(MSG_WAKE_UP)) {
+            // A message is already queued
+            return;
+        }
+
+        final TelephonyManager tm =
+                (TelephonyManager) mContext.getSystemService(Context.TELEPHONY_SERVICE);
+        final boolean hasIncomingCall = tm.getCallState() == TelephonyManager.CALL_STATE_RINGING;
+
+        if (mProximityWakeSupported && mProximityWakeEnabled
+                && mProximitySensor != null && !hasIncomingCall) {
+            final Message msg = mHandler.obtainMessage(MSG_WAKE_UP);
+            msg.obj = r;
+            mHandler.sendMessageDelayed(msg, mProximityTimeOut);
+            runPostProximityCheck(r);
+        } else {
+            r.run();
+        }
+    }
+
+    private void runPostProximityCheck(final Runnable r) {
+        if (mSensorManager == null) {
+            r.run();
+            return;
+        }
+        synchronized (mProximityWakeLock) {
+            mProximityWakeLock.acquire();
+            mProximityListener = new SensorEventListener() {
+                @Override
+                public void onSensorChanged(SensorEvent event) {
+                    cleanupProximityLocked();
+                    if (!mHandler.hasMessages(MSG_WAKE_UP)) {
+                        Slog.w(TAG, "Proximity sensor took too long, wake event already triggered!");
+                        return;
+                    }
+                    mHandler.removeMessages(MSG_WAKE_UP);
+                    final float distance = event.values[0];
+                    if (distance >= PROXIMITY_NEAR_THRESHOLD ||
+                            distance >= mProximitySensor.getMaximumRange()) {
+                        r.run();
+                    } else {
+                        Slog.w(TAG, "Not waking up. Proximity sensor is blocked.");
+                    }
+                }
+
+                @Override
+                public void onAccuracyChanged(Sensor sensor, int accuracy) {
+                    // Do nothing
+                }
+            };
+            mSensorManager.registerListener(mProximityListener,
+                   mProximitySensor, SensorManager.SENSOR_DELAY_FASTEST);
         }
     }
 }

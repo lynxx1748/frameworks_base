@@ -6212,7 +6212,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 && mGlobalKeyManager.shouldHandleGlobalKey(keyCode, event)) {
             if (isWakeKey) {
                 wakeUp(event.getEventTime(), mAllowTheaterModeWakeFromKey,
-                       "android.policy:KEY", true)
+                       "android.policy:KEY", true);
             }
             return result;
         }
@@ -7039,7 +7039,11 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         if (withProximityCheck) {
             mPowerManager.wakeUpWithProximityCheck(wakeTime, reason);
         } else {
-            mPowerManager.wakeUp(wakeTime, reason);
+            if (withProximityCheck) {
+             mPowerManager.wakeUpWithProximityCheck(wakeTime, reason);
+         } else {
+             mPowerManager.wakeUp(wakeTime, reason);
+         }
         }
         return true;
     }
