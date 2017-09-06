@@ -386,6 +386,9 @@ public class PhoneStatusBar extends BaseStatusBar implements DemoMode,
 
     // settings
     private QSPanel mQSPanel;
+ 
+   // show lte/4g switch
+   private boolean mShowLteFourGee;
 
     // qs headers
     private StatusBarHeaderMachine mStatusBarHeaderMachine;
@@ -608,6 +611,9 @@ public class PhoneStatusBar extends BaseStatusBar implements DemoMode,
             resolver.registerContentObserver(Settings.System.getUriFor(
                   Settings.System.BATTERY_SAVER_MODE_COLOR),
                   false, this, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                  Settings.System.SHOW_LTE_FOURGEE),
+                  false, this, UserHandle.USER_ALL);
             update();
         }
 
@@ -634,9 +640,18 @@ public class PhoneStatusBar extends BaseStatusBar implements DemoMode,
                             mContext.getContentResolver(),
                             Settings.System.BATTERY_SAVER_MODE_COLOR, 1,
                             UserHandle.USER_CURRENT);
+                    
                     if (mBatterySaverWarningColor != 0) {
                         mBatterySaverWarningColor = mContext.getResources()
                                 .getColor(com.android.internal.R.color.battery_saver_mode_color);
+
+                  } else if (uri.equals(Settings.System.getUriFor(
+                    Settings.System.SHOW_LTE_FOURGEE))) {
+                    mShowLteFourGee = Settings.System.getIntForUser(
+                            mContext.getContentResolver(),
+                            Settings.System.SHOW_LTE_FOURGEE,
+                            0, UserHandle.USER_CURRENT) == 1;
+                    mNetworkController.onConfigurationChanged();
                     }
                 update();
                 updateCarrier();
@@ -653,6 +668,8 @@ public class PhoneStatusBar extends BaseStatusBar implements DemoMode,
 
          public void update() {
             ContentResolver resolver = mContext.getContentResolver();
+            boolean mShowLteFourGee = Settings.System.getIntForUser(resolver,
+                    Settings.System.SHOW_LTE_FOURGEE, 0, UserHandle.USER_CURRENT) == 1;
             int mode = Settings.System.getIntForUser(mContext.getContentResolver(),
                             Settings.System.SCREEN_BRIGHTNESS_MODE,
                             Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL,

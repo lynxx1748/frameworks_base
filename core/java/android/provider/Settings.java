@@ -3899,6 +3899,12 @@ public final class Settings {
         public static final String SHOW_LOCKSCREEN_DATE = "show_lockscreen_date";
 
         /**
+         * Show the four 4g network icon instead of lte
+         * @hide
+         */
+        public static final String SHOW_LTE_FOURGEE = "show_lte_fourgee";
+
+        /**
          * Show or hide clock
          * 0 - hide
          * 1 - show (default)
