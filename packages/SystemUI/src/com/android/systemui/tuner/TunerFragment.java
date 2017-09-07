@@ -25,7 +25,8 @@ import android.support.v14.preference.SwitchPreference;
 import android.support.v7.preference.Preference;
 import android.support.v7.preference.Preference.OnPreferenceChangeListener;
 import android.support.v7.preference.PreferenceScreen;
-
+import android.provider.Settings;
+import android.provider.Settings.System;
 import com.android.internal.logging.MetricsLogger;
 import com.android.internal.logging.MetricsProto.MetricsEvent;
 import com.android.internal.util.unholy.UNHOLYUtils;
@@ -46,7 +47,7 @@ public class TunerFragment extends PreferenceFragment {
         final ContentResolver resolver = getActivity().getContentResolver();
 
         mShowLteFourGee = (SwitchPreference) findPreference(SHOW_LTE_FOURGEE);
-        if (screwdUtils.isWifiOnly(getActivity())) {
+        if (UNHOLYUtils.isWifiOnly(getActivity())) {
             prefSet.removePreference(mShowLteFourGee);
         } else {
         mShowLteFourGee.setChecked((Settings.System.getInt(resolver,
